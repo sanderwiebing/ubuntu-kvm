@@ -11,8 +11,9 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 NAME=
 IMAGE=
-MEM=4G
-SMP=2
+MEM=
+SMP=
+MEM_RESERVE_MB=2048
 PORT=
 GDB=false
 TASKSET=
@@ -35,8 +36,9 @@ Usage: $0 [option...] [BZIMAGE]
    --global-shared     Share ./shared instead of vms/NAME/shared
    -i, --image IMAGE   Base image to run without -n (default $SCRIPT_DIR/noble.img)
    --force             Run the base image read-write even if VMs depend on it
-   -m, --mem MEM       Memory (default $MEM)
-   -c, --smp N         CPUs (default $SMP)
+   -m, --mem MEM       Memory (default: host RAM minus ${MEM_RESERVE_MB}M)
+   -c, --smp N         CPUs (default: all host CPUs, mirroring the host's
+                       sockets/cores/threads and caches)
    -p, --port PORT     Host port forwarded to guest ssh (default 7777, or vms/NAME/port)
    -g, --gdb           Start gdb stub on :1234 and boot with nokaslr
    -t, --taskset CPUS  Pin QEMU to host CPUs (e.g. 4 or 4-7)
@@ -129,6 +131,21 @@ fi
 
 [ -n "$KERNEL" ] || { echo "Error: pass a BZIMAGE or --distro" >&2; display_help; exit 1; }
 
+# Default to the whole host: all memory but a reserve, and all CPUs with the
+# host's topology and cache info
+[ -n "$MEM" ] || MEM=$(( $(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo) - MEM_RESERVE_MB ))M
+CPU=host
+if [ -z "$SMP" ]; then
+    SMP=$(nproc)
+    read -r SOCKETS CORES THREADS <<< "$(lscpu | awk -F: '
+        /^Socket\(s\)/ { s = $2 } /^Core\(s\) per socket/ { c = $2 } /^Thread\(s\) per core/ { t = $2 }
+        END { print s + 0, c + 0, t + 0 }')"
+    if [ $((SOCKETS * CORES * THREADS)) -eq "$SMP" ]; then
+        SMP="$SMP,sockets=$SOCKETS,cores=$CORES,threads=$THREADS"
+        CPU=host,host-cache-info=on
+    fi
+fi
+
 APPEND="console=ttyS0 earlyprintk=serial root=/dev/vda rw net.ifnames=0 mitigations=off"
 QEMU_ARGS=()
 if $GDB; then
@@ -155,7 +172,7 @@ PREFIX=()
 exec "${PREFIX[@]}" qemu-system-x86_64 \
     -name "${NAME:-base}" \
     -enable-kvm \
-    -cpu host \
+    -cpu "$CPU" \
     -m "$MEM" \
     -smp "$SMP" \
     -kernel "$KERNEL" \
